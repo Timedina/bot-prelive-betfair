@@ -1,5 +1,4 @@
 import os
-os.environ["SUPABASE_BOT_ID_OVERRIDE"] = "4101d27c-2130-4517-b596-3969cf06f049"
 import sys, time, json, logging
 import betfair_client as bf
 try:
@@ -9,7 +8,11 @@ except ImportError:
     COMANDOS_DISPONIVEL = False
 from telegram_client import enviar_mensagem
 import supabase_integration as sb
-sb.SUPABASE_BOT_ID = "4101d27c-2130-4517-b596-3969cf06f049"
+import saude
+# Carrega ID do bot do .env para nao hardcodar
+SB_BOT_ID = os.getenv("SUPABASE_BOT_ID_UNDER25", "")
+if SB_BOT_ID:
+    sb.SUPABASE_BOT_ID = SB_BOT_ID
 from datetime import datetime, timezone, timedelta
 
 FUSO_BRASILIA = timezone(timedelta(hours=-3))
@@ -31,6 +34,7 @@ primeira_vez_visto = {}  # market_id -> timestamp primeira vez visto
 
 def get_filtros():
     f = sb.carregar_filtros()
+    saude.registrar("supabase", f is not None, "carregar_filtros")
     return {
         "ODD_MINIMA":          f.get("ODD_MINIMA",          ODD_MINIMA),
         "ODD_MAXIMA":          f.get("ODD_MAXIMA",          ODD_MAXIMA),
@@ -44,6 +48,7 @@ def get_filtros():
 def buscar_mercados_under25_ao_vivo():
     rpc = json.dumps({"jsonrpc":"2.0","method":"SportsAPING/v1.0/listMarketCatalogue","params":{"filter":{"eventTypeIds":["1"],"marketTypeCodes":["OVER_UNDER_25"],"inPlayOnly":True},"maxResults":"200","marketProjection":["COMPETITION","EVENT","RUNNER_DESCRIPTION","MARKET_START_TIME"]},"id":1})
     mercados = bf.chamar_api(rpc) or []
+    saude.registrar("betfair", mercados is not None, "listMarketCatalogue Under 2.5")
     from datetime import datetime, timezone
     agora = datetime.now(timezone.utc)
     for m in mercados:
@@ -65,6 +70,7 @@ def buscar_mercados_under25_ao_vivo():
 def obter_odd_e_liquidez_under(market_id, selection_id=None):
     rpc = json.dumps({"jsonrpc":"2.0","method":"SportsAPING/v1.0/listMarketBook","params":{"marketIds":[market_id],"priceProjection":{"priceData":["EX_BEST_OFFERS"],"virtualise":"true"}},"id":1})
     livros = bf.chamar_api(rpc) or []
+    saude.registrar("betfair", livros is not None, f"listMarketBook {market_id}")
     if not livros:
         return None, 0
     for runner in livros[0].get("runners", []):
@@ -126,6 +132,16 @@ def formatar_saida(jogo, odd_entrada, odd_saida, stake, pnl, motivo, market_id):
         f"\U0001f194 `{market_id}`"
     )
 
+
+def enviar_alerta(texto):
+    """Envia mensagem Telegram com monitoramento de saude."""
+    try:
+        enviar_mensagem(texto)
+        saude.registrar("telegram", True)
+    except Exception as e:
+        log.warning(f"  Erro Telegram: {e}")
+        saude.registrar("telegram", False, str(e))
+
 def verificar_entradas(filtros):
     mercados = buscar_mercados_under25_ao_vivo()
     log.info(f"Mercados Under 2.5 ao vivo: {len(mercados)}")
@@ -143,12 +159,22 @@ def verificar_entradas(filtros):
         odd, liq = obter_odd_e_liquidez_under(market_id, under_sel_id)
         if odd is None:
             log.info(f"  {nome_jogo} — runner Under 2.5 nao encontrado")
-            sb.registrar_analise_supabase({"event_id": market_id, "nome_jogo": nome_jogo, "competition": competition}, aprovado=False, motivos=["Runner Under 2.5 nao encontrado"])
+            try:
+                sb.registrar_analise_supabase({"event_id": market_id, "nome_jogo": nome_jogo, "competition": competition}, aprovado=False, motivos=["Runner Under 2.5 nao encontrado"])
+                saude.registrar("supabase", True)
+            except Exception as e:
+                log.warning(f"  Erro Supabase (analise): {e}")
+                saude.registrar("supabase", False, str(e))
             continue
         log.info(f"  {nome_jogo} | min={minuto} | odd={odd:.2f} | liq=£{liq:.0f}")
         if not (filtros["ODD_MINIMA"] <= odd <= filtros["ODD_MAXIMA"]):
             log.info(f"    Odd fora do intervalo [{filtros['ODD_MINIMA']}, {filtros['ODD_MAXIMA']}]")
-            sb.registrar_analise_supabase({"event_id": market_id, "nome_jogo": nome_jogo, "competition": competition, "minuto": minuto}, aprovado=False, motivos=[f"Odd {odd:.2f} fora do intervalo [{filtros['ODD_MINIMA']}, {filtros['ODD_MAXIMA']}]"])
+            try:
+                sb.registrar_analise_supabase({"event_id": market_id, "nome_jogo": nome_jogo, "competition": competition, "minuto": minuto}, aprovado=False, motivos=[f"Odd {odd:.2f} fora do intervalo [{filtros['ODD_MINIMA']}, {filtros['ODD_MAXIMA']}]"])
+                saude.registrar("supabase", True)
+            except Exception as e:
+                log.warning(f"  Erro Supabase (analise): {e}")
+                saude.registrar("supabase", False, str(e))
             continue
         liq_minima = filtros["LIQUIDEZ_MINIMA"]
         if minuto <= 2:
@@ -157,14 +183,24 @@ def verificar_entradas(filtros):
             liq_minima = min(100.0, liq_minima)
         if liq < liq_minima:
             log.info(f"    Liquidez £{liq:.0f} < minimo £{liq_minima:.0f}")
-            sb.registrar_analise_supabase({"event_id": market_id, "nome_jogo": nome_jogo, "competition": competition, "minuto": minuto}, aprovado=False, motivos=[f"Liquidez £{liq:.0f} < minimo £{liq_minima:.0f}"])
-            enviar_mensagem(f"⚠️ *Under 2.5 — Liquidez insuficiente*\n⚽ {nome_jogo}\n⏱ Min: {minuto}\n💰 Odd: {odd:.2f} (no intervalo)\n💵 Liquidez: £{liq:.0f} < £{liq_minima:.0f}")
+            try:
+                sb.registrar_analise_supabase({"event_id": market_id, "nome_jogo": nome_jogo, "competition": competition, "minuto": minuto}, aprovado=False, motivos=[f"Liquidez £{liq:.0f} < minimo £{liq_minima:.0f}"])
+                saude.registrar("supabase", True)
+            except Exception as e:
+                log.warning(f"  Erro Supabase (analise): {e}")
+                saude.registrar("supabase", False, str(e))
+            enviar_alerta(f"⚠️ *Under 2.5 — Liquidez insuficiente*\n⚽ {nome_jogo}\n⏱ Min: {minuto}\n💰 Odd: {odd:.2f} (no intervalo)\n💵 Liquidez: £{liq:.0f} < £{liq_minima:.0f}")
             continue
         stake = filtros["STAKE_FIXO"]
         log.info(f"    ENTRADA — stake=£{stake} @ {odd:.2f}")
         apostas_ativas[market_id] = {"nome_jogo": nome_jogo, "competition": competition, "odd_entrada": odd, "stake": stake, "entrada_em": time.time(), "minuto_entrada": minuto, "under_sel_id": under_sel_id}
-        sb.registrar_analise_supabase({"event_id": market_id, "nome_jogo": nome_jogo, "competition": competition, "minuto": minuto}, aprovado=True, motivos=[f"odd={odd:.2f}", f"min={minuto}"])
-        enviar_mensagem(formatar_entrada(nome_jogo, competition, odd, stake, minuto, market_id))
+        try:
+            sb.registrar_analise_supabase({"event_id": market_id, "nome_jogo": nome_jogo, "competition": competition, "minuto": minuto}, aprovado=True, motivos=[f"odd={odd:.2f}", f"min={minuto}"])
+            saude.registrar("supabase", True)
+        except Exception as e:
+            log.warning(f"  Erro Supabase (analise aprovada): {e}")
+            saude.registrar("supabase", False, str(e))
+        enviar_alerta(formatar_entrada(nome_jogo, competition, odd, stake, minuto, market_id))
 
 def verificar_saidas(filtros):
     for market_id, ap in list(apostas_ativas.items()):
@@ -183,8 +219,13 @@ def verificar_saidas(filtros):
             motivo = f"Tempo limite ({filtros['SAIDA_MINUTOS']} min)"
         if motivo:
             log.info(f"  SAIDA {ap['nome_jogo']} — {motivo} | pnl=£{pnl:+.2f}")
-            enviar_mensagem(formatar_saida(ap["nome_jogo"], odd_entrada, odd_atual, stake, pnl, motivo, market_id))
-            sb.atualizar_resultado_aposta_supabase(market_id, "VITORIA" if pnl > 0 else "PERDA", "--", pnl)
+            enviar_alerta(formatar_saida(ap["nome_jogo"], odd_entrada, odd_atual, stake, pnl, motivo, market_id))
+            try:
+                sb.atualizar_resultado_aposta_supabase(market_id, "VITORIA" if pnl > 0 else "PERDA", "--", pnl)
+                saude.registrar("supabase", True)
+            except Exception as e:
+                log.warning(f"  Erro Supabase (resultado): {e}")
+                saude.registrar("supabase", False, str(e))
             del apostas_ativas[market_id]
 
 def verificar_heartbeat():
@@ -194,14 +235,14 @@ def verificar_heartbeat():
         hoje = agora.date()
         if heartbeat_enviado_em != hoje:
             heartbeat_enviado_em = hoje
-            enviar_mensagem(f"\U0001f49a *Bot Under 2.5 — Online*\n\U0001f4c5 {agora.strftime('%d/%m/%Y %H:%M')} (Brasilia)\n\U0001f3af Apostas ativas: {len(apostas_ativas)}")
+            enviar_alerta(f"\U0001f49a *Bot Under 2.5 — Online*\n\U0001f4c5 {agora.strftime('%d/%m/%Y %H:%M')} (Brasilia)\n\U0001f3af Apostas ativas: {len(apostas_ativas)}")
 
 def main():
     log.info("=== BOT BACK UNDER 2.5 INICIANDO ===")
     if not bf.login():
         log.error("Falha no login Betfair. Abortando.")
         sys.exit(1)
-    enviar_mensagem("Bot Under 2.5 iniciado - modo simulacao")
+    enviar_alerta("Bot Under 2.5 iniciado - modo simulacao")
     while True:
         try:
             bf.renovar_token_se_necessario()
@@ -212,11 +253,11 @@ def main():
             verificar_saidas(filtros)
         except KeyboardInterrupt:
             log.info("Interrompido.")
-            enviar_mensagem("Bot Under 2.5 encerrado.")
+            enviar_alerta("Bot Under 2.5 encerrado.")
             break
         except Exception as e:
             log.error(f"Erro no loop: {e}")
-            enviar_mensagem(f"Bot Under 2.5 - erro: {e}")
+            enviar_alerta(f"Bot Under 2.5 - erro: {e}")
         time.sleep(INTERVALO_LOOP)
 
 if __name__ == "__main__":
