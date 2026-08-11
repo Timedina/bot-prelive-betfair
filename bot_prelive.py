@@ -1345,6 +1345,19 @@ def analisar_jogo(event_id: str, nome_jogo: str, minutos: float, market_id_cs_hi
     resultado['no_limite'] = bool(detalhes_limite)
     resultado['no_limite_detalhes'] = '; '.join(detalhes_limite)
     resultado['aprovado'] = True
+
+    # --- MODO SOMBRA: filtros candidatos, apenas logados, NAO bloqueiam aprovacao ---
+    try:
+        _razao_sombra = (odd_01 / odd_10) if odd_10 else None
+        resultado['sombra_razao_estreita'] = (
+            _razao_sombra is not None and not (1.2 <= _razao_sombra <= 1.6)
+        )
+        resultado['sombra_odd01_min25'] = odd_01 < 25
+        resultado['sombra_odd01_min30'] = odd_01 < 30
+        resultado['sombra_favorito_1_9_2_1'] = not (1.90 <= odd_favorito <= 2.09)
+    except Exception as _e_sombra:
+        log.warning(f"Modo sombra: falha ao calcular flags ({_e_sombra}), seguindo sem elas")
+
     return resultado
 
 
@@ -1664,6 +1677,8 @@ def rodar_bot():
                     aprovados_por_dia = resultado_jogos.atualizar_resultados_pendentes(dias_atras=14, verbose=False)
                     aprovados_agora = {}
                     for _dia, _info_dia in aprovados_por_dia.items():
+                        for _eid, _info in _info_dia.items():
+                            _info.setdefault('event_id', _eid)
                         aprovados_agora.update(_info_dia)
                     if aprovados_agora:
                         novos_resultados = [

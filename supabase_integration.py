@@ -95,6 +95,10 @@ def registrar_analise_supabase(info: dict, aprovado: bool, motivos: list = None)
             'runners_cs_map':      info.get('runners_cs_map', {}),
             'no_limite':           info.get('no_limite', False),
             'no_limite_detalhes':  info.get('no_limite_detalhes', ''),
+            'sombra_razao_estreita': info.get('sombra_razao_estreita'),
+            'sombra_odd01_min25': info.get('sombra_odd01_min25'),
+            'sombra_odd01_min30': info.get('sombra_odd01_min30'),
+            'sombra_favorito_1_9_2_1': info.get('sombra_favorito_1_9_2_1'),
         }).execute()
     except Exception as e:
         _circuit_breaker.registrar_falha()

@@ -294,3 +294,37 @@ Requer env vars: ODDSPAPI_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_KEY
 - Pendência aberta: checar se `watchdog_bot.sh` (reinicia se journal mudo por 5min) não vai tentar religar o bot automaticamente enquanto pausado via `/pausar` — ainda não verificado.
 
 *Ultima atualizacao: 07/08/2026*
+
+## Atualização 11/08/2026 — Bugs criticos corrigidos: jogos pendentes nunca resolviam (placar + Supabase)
+
+- **Sintoma**: dashboard mostrava dezenas de apostas travadas em PENDENTE por dias (desde 02/08), mesmo com o bot rodando saudavel e outros jogos resolvendo normalmente.
+
+- **Bug 1 (raiz) em `resultado_jogos.py`**: quando o mercado Correct Score ja estava fechado, o codigo fazia uma segunda chamada a Betfair (`buscar_nome_runner_vencedor` via `listMarketCatalogue`) pra descobrir o nome do placar vencedor — mas a Betfair para de retornar mercados ja fechados ha muito tempo nesse endpoint, entao a chamada voltava `None` e o jogo nunca era marcado como resolvido, tentando de novo (e falhando) todo ciclo, sem nenhum log de erro em producao (o crash real `unsupported format string passed to NoneType.__format__` so aparecia com `verbose=True`, mascarando o bug quando `verbose=False`).
+  - Fix: usar primeiro o `runners_cs_map` (mapa `selectionId -> placar`) que ja fica salvo localmente na hora da analise, so cair pro `listMarketCatalogue` como fallback. Corrigido tambem o crash de formatacao do print verbose quando `pnl_estimado` for `None`.
+  - Backup: `resultado_jogos.py.bak_placar_pendente`.
+
+- **Bug 2 (Supabase nunca atualizava, mesmo com o placar resolvido) em `bot_prelive.py`**: o loop que envia resultado pro Supabase montava `aprovados_agora` com `.update(_info_dia)` e depois iterava com `.values()`, perdendo a chave `event_id` do dicionario. A chamada `sb.atualizar_resultado_aposta_supabase(event_id=info.get('event_id', ''), ...)` sempre ia com `event_id` vazio — o UPDATE no Supabase nao batia em nenhuma linha (sem erro, 0 linhas afetadas), e o log `Resultado auto: ... VITORIA` aparecia normalmente mesmo sem nada ser gravado (o `log.info` roda antes da chamada ao Supabase, entao nao prova que ela funcionou).
+  - Fix: ao montar `aprovados_agora`, injetar `_info.setdefault('event_id', _eid)` usando a chave do dicionario antes do `.update()`.
+  - Os 16 jogos ja resolvidos localmente (que tinham `_telegram_enviado=True` e por isso nao seriam reprocessados automaticamente pelo bot) foram corrigidos com UPDATE manual direto no Supabase, usando os dados de PnL/placar ja calculados no log.
+  - Backup: `bot_prelive.py.bak_event_id_fix`.
+
+- **Validacao**: 17 jogos de 09-11/08 resolvidos de uma vez apos os dois patches (PnL calculado corretamente, gravado no Supabase). Unico caso que continua PENDENTE: `Deportes Limache v Nublense` (mesmo jogo de liquidez baixissima ja tratado manualmente em 03/08) — nao tem `runners_cs_map` salvo, parece ser dado insuficiente daquele jogo especifico, nao um bug sistemico.
+
+- **Deploy do dashboard (nao-bug)**: um deploy antigo (commit `refactor: atualiza arquivos principais do projeto`, branch `refactor/v2-foundation`) falhou no Vercel com `vite: command not found` — mas ja tinha sido superado por dois commits seguintes na `main` que buildaram normalmente; producao (`betbots-dashboard.vercel.app`) esta servindo a versao boa, sem acao necessaria.
+
+- **Pendencia nao resolvida nessa sessao**: RLS ainda desativado em 4 tabelas do Supabase (`apostas`, `metricas`, `historical_odds`, `resultados_reais`) — expostas a leitura/escrita via chave anon. SQL de correcao ja levantado, aguardando decisao de aplicar junto com politica de leitura publica.
+
+- **Licao de processo**: log de sucesso emitido antes de confirmar o retorno de uma chamada de rede/DB nao garante que a chamada funcionou — nesse caso um UPDATE de 0 linhas nao gera excecao, entao o log mentiu por dias sem ninguem perceber. Preferir logar depois de confirmar sucesso, ou logar o retorno real da chamada.
+
+*Ultima atualizacao: 11/08/2026*
+
+## Atualização 11/08/2026 (cont.) — Modo sombra para filtros candidatos (razão odd_01/odd_10, odd_01 mínima, faixa odd_favorito)
+
+- **Motivação**: análise de perdas mostrou win rate real (~92%) abaixo do breakeven teórico (~94%) na odd média (~17), e nenhuma variável isolada (razão CS, diferença 1X2, liquidez, odd_favorito, minuto, IA, no_limite) separou vitória de derrota de forma confiável na amostra disponível (13 perdas / 146 vitórias) — sinal fraco demais pra virar filtro direto sem violar a regra de N>=30 por segmento.
+- **Implementação**: bloco novo em `bot_prelive.py`, logo após `resultado['aprovado'] = True` (mesmo padrão do bloco `no_limite`), calculando 4 flags booleanas SEM bloquear aprovação: `sombra_razao_estreita` (razão odd_01/odd_10 fora de 1.2-1.6), `sombra_odd01_min25` (odd_01 < 25), `sombra_odd01_min30` (odd_01 < 30), `sombra_favorito_1_9_2_1` (odd_favorito fora de 1.90-2.09).
+- **Patch em `supabase_integration.py` precisou de 2 tentativas**: a v1 assumiu âncora `resultado.get('no_limite')`, mas o dict real usa `info.get('no_limite', False)` com espaçamento de alinhamento — abortou sem quebrar nada (comportamento esperado). v2 corrigida: em vez de bater string exata, localiza a LINHA contendo `'no_limite_detalhes':` e insere as novas linhas logo depois, copiando a indentação real (12 espaços). Aplicado na linha 97.
+- **Migration no Supabase**: 4 colunas booleanas novas adicionadas via MCP direto (`ALTER TABLE analises ADD COLUMN...`): `sombra_razao_estreita`, `sombra_odd01_min25`, `sombra_odd01_min30`, `sombra_favorito_1_9_2_1`.
+- **Backups**: `bot_prelive.py.bak_sombra`, `supabase_integration.py.bak_sombra` (v1, não usado), `supabase_integration.py.bak_sombra_v2` (backup real, pré-patch v2).
+- **Validado**: `ast.parse` OK nos dois patches, `validar_env.sh` OK, `bot-betfair.service` reiniciado 23:35:33 UTC (11/08) sem erro no journal.
+- **Pendência**: aguardando primeira análise aprovada pós-restart pra confirmar que as flags estão sendo gravadas de verdade (checado 23:36 UTC, ainda `null` nas últimas aprovações — todas anteriores ao restart).
+- **Query de avaliação pronta**: `avaliar_filtros_sombra.sql` (fora do repo, mantido junto ao chat) — 3 passos: (0) checa N>=30 nos dois lados de cada flag, (1) win rate/PnL por flag, (2) teste de diferença de proporção. Só promover um filtro sombra a filtro real de produção se passar nos 3 critérios (N>=30 + win rate visivelmente menor + diferença > 2x erro padrão).

@@ -205,9 +205,12 @@ def atualizar_resultados_do_dia(data_str=None, verbose=True):
         # Busca nome do runner vencedor
         placar_final = None
         if res.get('runner_id'):
-            nome = buscar_nome_runner_vencedor(market_id, res['runner_id'])
+            runner_id = res['runner_id']
+            mapa_cs = info.get('runners_cs_map') or {}
+            nome = mapa_cs.get(str(runner_id))
+            if not nome:
+                nome = buscar_nome_runner_vencedor(market_id, runner_id)
             if nome:
-                # Normaliza nome do placar (ex: "1 - 0" → "1-0")
                 placar_final = nome.replace(' ', '').replace('–', '-')
 
         # Calcula resultado do LAY
@@ -225,7 +228,9 @@ def atualizar_resultados_do_dia(data_str=None, verbose=True):
 
         if verbose:
             emoji = '✅' if resultado_lay['resultado_geral'] == 'VITORIA' else '⚠️'
-            print(f"    {emoji} Placar: {placar_final} | {resultado_lay['resultado_geral']} | PnL: {resultado_lay['pnl_estimado']:+.2f}")
+            pnl_val = resultado_lay['pnl_estimado']
+            pnl_txt = f"{pnl_val:+.2f}" if pnl_val is not None else "N/A"
+            print(f"    {emoji} Placar: {placar_final} | {resultado_lay['resultado_geral']} | PnL: {pnl_txt}")
 
     if atualizados > 0:
         salvar_aprovados(aprovados, data_str)
