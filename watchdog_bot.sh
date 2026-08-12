@@ -8,7 +8,7 @@ LOG_FILE="/home/ubuntu/bot-prelive-betfair/watchdog.log"
 ENV_FILE="/home/ubuntu/bot-prelive-betfair/.env"
 
 LIMITE_MUDO_MIN=5
-LIMITE_SEM_ANALISE_MIN=90
+LIMITE_SEM_ANALISE_MIN=180
 
 # Carrega TELEGRAM_TOKEN/TELEGRAM_CHAT_ID do .env sem expor no processo
 TELEGRAM_TOKEN=$(grep -E "^TELEGRAM_TOKEN=" "$ENV_FILE" | cut -d= -f2-)
