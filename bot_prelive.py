@@ -1241,7 +1241,7 @@ def analisar_jogo(event_id: str, nome_jogo: str, minutos: float, market_id_cs_hi
     liquidez_disponivel = calcular_liquidez_disponivel_lay(
         runners_cs_book, runners_cs_map, ['1 - 0', '0 - 1']
     )
-    liquidez_total = book_cs.get('totalMatched', 0)
+    liquidez_total = book_cs.get('totalMatched') or 0
 
     if liquidez_disponivel < LIQUIDEZ_MINIMA_CS_DISPONIVEL:
         status_mercado = book_cs.get('status', '?')
