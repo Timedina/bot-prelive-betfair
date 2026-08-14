@@ -793,6 +793,33 @@ def processar_comandos(agendador, stats, resultado_jogos, carregar_aprovados_do_
             except Exception as e:
                 responder(chat_id, f'Erro /saude: {e}')
 
+        elif texto == '/sessao':
+            try:
+                import supabase_integration as sb
+                iniciada_em_str = sb.obter_sessao_betfair()
+                if not iniciada_em_str:
+                    responder(chat_id, 'Sem sessao registrada ainda.')
+                else:
+                    iniciada_em = datetime.fromisoformat(iniciada_em_str.replace('Z', '+00:00'))
+                    agora = datetime.now(timezone.utc)
+                    decorrido_seg = (agora - iniciada_em).total_seconds()
+                    limite_seg = 23 * 3600
+                    restante_seg = limite_seg - decorrido_seg
+                    h_dec = int(decorrido_seg // 3600)
+                    m_dec = int((decorrido_seg % 3600) // 60)
+                    if restante_seg > 0:
+                        h_rest = int(restante_seg // 3600)
+                        m_rest = int((restante_seg % 3600) // 60)
+                        if restante_seg > 2 * 3600:
+                            emoji = '\U0001f7e2'
+                        else:
+                            emoji = '\U0001f7e1'
+                        responder(chat_id, f'{emoji} Sessao Betfair ha {h_dec}h{m_dec:02d}min\nFaltam ~{h_rest}h{m_rest:02d}min para o limite de 23h')
+                    else:
+                        responder(chat_id, f'\U0001f534 Sessao Betfair ha {h_dec}h{m_dec:02d}min - pode ja ter passado do limite de 23h')
+            except Exception as e:
+                responder(chat_id, f'Erro /sessao: {e}')
+
         elif texto == '/restart':
             responder(chat_id, '🔄 Reiniciando bot LAY (bot-betfair.service)...')
             try:

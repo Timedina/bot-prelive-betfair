@@ -54,6 +54,35 @@ def _validar_aposta(info: dict, res_aposta: dict) -> tuple[bool, str]:
     return True, ''
 
 
+def registrar_sessao_betfair(inicio):
+    """Registra o horario real de inicio de sessao continua na Betfair (reseta so no logout de verdade)."""
+    if not SUPABASE_ATIVO:
+        return
+    try:
+        import os
+        _client.table('sessao_betfair').upsert({
+            'id': 1,
+            'iniciada_em': inicio.isoformat(),
+            'bot_origem': os.getenv('SUPABASE_BOT_ID', 'desconhecido'),
+            'atualizada_em': __import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),
+        }).execute()
+    except Exception as e:
+        log.warning(f'  Erro ao registrar sessao_betfair: {e}')
+
+
+def obter_sessao_betfair():
+    """Retorna o timestamp ISO de inicio da sessao Betfair atual, ou None."""
+    if not SUPABASE_ATIVO:
+        return None
+    try:
+        resp = _client.table('sessao_betfair').select('iniciada_em').eq('id', 1).execute()
+        if resp.data:
+            return resp.data[0]['iniciada_em']
+    except Exception as e:
+        log.warning(f'  Erro ao obter sessao_betfair: {e}')
+    return None
+
+
 def registrar_analise_supabase(info: dict, aprovado: bool, motivos: list = None):
     """Espelha o que salvar_historico_completo grava localmente, na tabela `analises`."""
     if not SUPABASE_ATIVO:
@@ -209,7 +238,7 @@ def carregar_filtros() -> dict:
     if not SUPABASE_ATIVO:
         return _filtros_cache
     try:
-        bot_id_atual = os.getenv('SUPABASE_BOT_ID_OVERRIDE', os.getenv('SUPABASE_BOT_ID', SUPABASE_BOT_ID))
+        bot_id_atual = os.getenv('SUPABASE_BOT_ID_OVERRIDE', SUPABASE_BOT_ID)  # FIX 13/08: usar var do modulo (respeita override em runtime feito por bot_under25.py), nao reler env direto
         resp = (
             _client.table('filtros')
             .select('chave,valor,valor_copa,valor_texto')
