@@ -418,3 +418,52 @@ Requer env vars: ODDSPAPI_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_KEY
   - Seguem em aberto de sessões anteriores: confirmar `gemini-flash-latest` vetando de verdade, medir consumo real de API Betfair do dia, rotacionar chaves expostas em chat, endurecer SSH (`PasswordAuthentication no`) / instalar fail2ban.
 
 *Ultima atualizacao: 14/08/2026*
+
+## Atualização 15/08/2026 00:59
+- Bug crítico corrigido: apostas travadas em PENDENTE causadas por 'NoneType' object has no attribute 'replace' em resumo_resultados() (resultado_jogos.py:288, info.get('resultado_geral', '') não protegia contra None explícito); fix result = info.get('resultado_geral') or ''; validado em produção (9 apostas resolvidas). SSH endurecido: PasswordAuthentication no + fail2ban ativo na jail sshd. Pendente: reboot do VPS para aplicar kernel novo (sem urgência).
+
+## Atualização 15/08/2026 01:20
+- Melhorias dashboard (Timedina/betbots-dashboard): item 3 (Realtime) descartado por ora, exigiria trocar fetch() REST cru pela lib @supabase/supabase-js (Realtime usa WebSocket); polling 30s considerado suficiente. Item 5 (badges visuais no_limite/sombra_*) CONCLUÍDO: componente FlagBadges na coluna Status da aba Analises, badge âmbar 'No limite' + badge azul 'Sombra (N)' com tooltips; commit 0adf0eb, push feito, build validado. Item 4 (virtualização) pulado: tabela já limitada a 200 linhas via query, sem ganho real hoje. Próximo: item 6 (filtros persistidos na URL), depois item 7 (drill-down segmentação).
+
+## Atualização 16/08/2026 04:35
+- Backtest do filtro RAZAO_ODD_MAXIMA=1.7 + ODD_01_MINIMA=18.5: rejeitado. Subir a odd mínima de 18 pra 18,5 cortaria 5 apostas (todas vitórias, +27,55u) sem evitar nenhuma das 3 perdas do período — RAZAO_ODD_MAXIMA=1.7 e ODD_01_MINIMA=18 mantidos como estão.
+- Varredura de correlação (189 apostas resolvidas do bot LAY, 13 perdas / 176 vitórias) pra testar hipótese de pontuação ponderada com peso em odd_over15: odd_over15, razão, odd_01, odd_favorito, odd_btts e liquidez_disponivel NÃO mostraram poder discriminante real (médias/win-rate por faixa praticamente idênticos entre vitória e perda) — descartado dar peso a essas variáveis.
+- Único sinal real encontrado: `minuto=-10` (entrada pré-jogo, 10 min antes do kickoff) e `no_limite=true` (aprovação limítrofe nos filtros). Testado isoladamente e combinado:
+  - Baseline (189 apostas): 93.1% win rate, PnL -273.26u
+  - Excluir minuto=-10: 94.3%, PnL -35.26u
+  - Excluir no_limite=true: 94.6%, PnL +46.58u
+  - Excluir os dois: 95.9%, PnL +211.20u (n cai pra 122, -35% de volume)
+- Implementado sistema de classificação de confiança (`confianca.py`, novo arquivo em `~/bot-prelive-betfair/`) com 4 grupos baseados em win rate histórico real (A=96% n=116, B=91% n=53, C=75% n=8 amostra pequena, D=83% n=6 amostra pequena). Função `classificar_confianca(minuto, no_limite)` retorna grupo/label/pct/n_amostra; `formatar_para_telegram()` formata a linha com emoji e aviso quando a amostra é pequena.
+- Migration aplicada no Supabase (`add_confianca_columns_to_analises`): colunas `confianca_grupo` (text) e `confianca_pct` (integer) adicionadas em `analises`.
+- Patches aplicados via Python script com anchor de segurança (aborta se anchor não encontrado ou duplicado), com backup automático antes de cada edição (`bot_prelive.py.bak_*`, `supabase_integration.py.bak_*`):
+  - `bot_prelive.py` (linha ~1347): chama `classificar_confianca()` logo após `resultado['no_limite_detalhes']` ser definido, grava `resultado['confianca_grupo']` e `resultado['confianca_pct']`.
+  - `supabase_integration.py` (linha ~127): grava os dois campos no insert de `analises`.
+- `py_compile` validado sem erro nos dois arquivos. Serviço `bot-betfair.service` reiniciado às 07:31 UTC, log limpo (sem traceback, fila normal 264 aguardando).
+- **Pendente**: confirmar via Supabase, após o próximo ciclo de análise (~04:55 local / 07:55 UTC), que `confianca_grupo`/`confianca_pct` estão sendo gravados corretamente nas novas análises.
+- **Pendente futuro**: expor `confianca` na mensagem do Telegram (`formatar_para_telegram()` já pronta, falta plugar no ponto de envio de alerta de aposta) e criar badge no dashboard (Timedina/betbots-dashboard) similar ao `FlagBadges` existente.
+- Nota: grupos C e D (minuto=-10) têm amostra pequena (n=8 e n=6) — reavaliar os percentuais quando a base tiver mais uns 50+ apostas novas resolvidas.
+
+
+## Atualização 19/08/2026 — Confiança no Telegram (LAY) + bug critico de sessao_betfair (singleton) + causa raiz do bloqueio de conta ~23h
+
+- **Confianca no alerta do Telegram (LAY)**: `formatar_para_telegram()` (ja existente em `confianca.py`) plugada em `formatar_alerta()` (`bot_prelive.py`). Import de `classificar_confianca`/`formatar_para_telegram` adicionado, chamada inserida logo apos `ia_str` (usa `minutos` e `info.get('no_limite')` ja disponiveis no dict, sem depender de campos extras gravados no Supabase), linha de confianca inserida no corpo do alerta entre `market_id_cs` e o rodape de monitoramento. Backup: `bot_prelive.py.bak_confianca_telegram_*`. Validado com `ast.parse`/`py_compile`, restart sem erro.
+- **Decisao**: sistema de confianca (grupos A-D) fica exclusivo do bot LAY — os win rates foram calibrados sobre o historico dele; nao sera replicado para o Under25 sem recalibrar.
+- **Confirmado via Supabase** (antes do plug no Telegram): `confianca_grupo`/`confianca_pct` gravando corretamente em 100% das analises aprovadas do LAY desde o restart de 16/08 (24/24). As ~4000 analises sem o campo preenchido no periodo sao todas reprovacoes (nunca chegam no ponto do calculo) ou aprovacoes do Under25 (bot que nao usa esse sistema, por decisao acima) — nao e bug.
+
+- **Bug critico descoberto: `sessao_betfair` era tabela singleton (`id=1` fixo + `CHECK (id=1)`)**. LAY e Under25 sobrescreviam o registro de sessao um do outro a cada login, tornando o comando `/sessao` (e qualquer analise de duracao de sessao) nao confiavel havia dias — o dado mostrado podia ser de qualquer um dos dois bots, dependendo de quem logou por ultimo.
+  - Fix em 2 migrations via Supabase MCP: (1) `sessao_betfair_por_bot` — dropada a constraint singleton e a PK antiga em `id`, nova PK em `bot_origem` (uma linha por bot agora), `NOTIFY pgrst reload schema`. (2) `sessao_betfair_fix_id_nullable` — a migration 1 deixou a coluna `id` orfa com `NOT NULL` sem `DEFAULT`, quebrando o insert do Under25 (`null value in column "id"`); corrigido tornando `id` nullable (coluna morta, mantida so por historico/nao quebrar leituras antigas).
+  - Fix em `supabase_integration.py`: `registrar_sessao_betfair()`/`obter_sessao_betfair()` reescritas para upsert/select por `bot_origem` (`on_conflict='bot_origem'`) em vez de `id=1`. Backup: `supabase_integration.py.bak_sessao_por_bot_*`.
+  - **Bug secundario no proprio patch**: primeira versao usava `os.getenv('SUPABASE_BOT_ID')` lido em runtime — retornou o ID do LAY mesmo rodando no processo do Under25 (confirmado: Under25 gravou a sessao com `bot_origem` do LAY). Causa: `supabase_integration.py` define `SUPABASE_BOT_ID` como variavel de MODULO, lida do `os.getenv()` uma unica vez no import; `bot_under25.py` sobrescreve essa variavel do modulo (`sb.SUPABASE_BOT_ID = "4101d27c..."`) logo no startup — padrao ja documentado e corrigido antes em outro ponto do codigo (comentario "FIX 13/08" na linha ~247), mas que eu reintroduzi por reler `os.getenv()` direto em vez de usar a variavel do modulo. Corrigido para `os.getenv('SUPABASE_BOT_ID_OVERRIDE', SUPABASE_BOT_ID)`, mesmo padrao da linha 247. Backup: `supabase_integration.py.bak_fix_bot_id_source_*`.
+  - Validado apos o fix: tabela com 2 linhas separadas, `bot_origem` batendo corretamente com cada bot (LAY e Under25 logaram simultaneamente no restart de teste e cada um gravou sua propria linha).
+  - **View de monitoramento criada** (`v_status_sessao_betfair`, via Supabase MCP): mostra `bot` (nome legivel), `horas_decorridas`, `horas_restantes_limite` (ate 23h) e `status` (OK/ATENCAO >=19h/CRITICO >=21h/VENCIDO >=23h) por bot, para acompanhar e comparar LAY x Under25 ao longo do dia.
+
+- **Causa raiz provavel do bloqueio de conta perto das ~23h (recorrente, ja visto em 13/08)**: `bf.renovar_token_se_necessario()` (keep-alive proativo, `KEEP_ALIVE_INTERVALO_HORAS=4` no pacote compartilhado `betfair_client`) **nunca era chamado no loop principal do bot LAY** (`bot_prelive.py`) — so o Under25 chamava, a cada iteracao do `while True`. O LAY dependia 100% do relogin reativo (so ao detectar `INVALID_SESSION` em `chamar_api()`), reproduzindo o mesmo padrao de rajada de login perto do limite de sessao que gerou o bloqueio de conta original em 13/08 — o fix de keep-alive daquela data nunca chegou a proteger o LAY de verdade, so o Under25.
+  - Fix: `bf.renovar_token_se_necessario()` adicionado como primeira chamada dentro do `while True:` de `rodar_bot()` em `bot_prelive.py`, mesmo padrao ja usado em `bot_under25.py`. Backup: `bot_prelive.py.bak_keepalive_lay_*`.
+  - Validado: `ast.parse`/`py_compile` OK, `bot-betfair.service` reiniciado 23:36 UTC sem erro no journal.
+  - **Nota de investigacao**: a suspeita inicial era o oposto (Under25 ficando conectado tempo demais) — na verdade era o LAY que estava desprotegido. A tabela `sessao_betfair` quebrada (ver acima) provavelmente mascarou isso por dias, ja que o `/sessao` podia estar mostrando o dado do bot errado.
+  - **Pendente**: observar as proximas ~23h via `v_status_sessao_betfair` / `/sessao` para confirmar que o LAY nao bate mais em VENCIDO/bloqueio de conta com o keep-alive ativo nos dois bots agora.
+
+- **Pendencia aberta, ainda nao testada** (arrastada desde 07/08): confirmar se `watchdog_bot.sh` (restart se journal mudo por `LIMITE_MUDO_MIN=5min`) religa o bot automaticamente durante uma pausa manual via `/pausar` — o script nao tem nenhuma logica hoje para diferenciar silencio por pausa intencional de travamento real.
+- **Nao critico, decidir depois**: linha orfa em `sessao_betfair` com `bot_origem` do LAY mas timestamp do momento em que o Under25 tentou gravar (do periodo em que o bug de `os.getenv` ainda estava ativo) — foi sobrescrita pelo upsert correto depois do fix, nao precisa de limpeza manual.
+
+*Ultima atualizacao: 19/08/2026*

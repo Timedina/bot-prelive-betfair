@@ -55,27 +55,31 @@ def _validar_aposta(info: dict, res_aposta: dict) -> tuple[bool, str]:
 
 
 def registrar_sessao_betfair(inicio):
-    """Registra o horario real de inicio de sessao continua na Betfair (reseta so no logout de verdade)."""
+    """Registra o horario real de inicio de sessao continua na Betfair (reseta so no logout de verdade).
+    Uma linha por bot_origem — cada bot mantem seu proprio registro de sessao."""
     if not SUPABASE_ATIVO:
         return
     try:
         import os
+        bot_id = os.getenv('SUPABASE_BOT_ID_OVERRIDE', SUPABASE_BOT_ID)
         _client.table('sessao_betfair').upsert({
-            'id': 1,
             'iniciada_em': inicio.isoformat(),
-            'bot_origem': os.getenv('SUPABASE_BOT_ID', 'desconhecido'),
+            'bot_origem': bot_id,
             'atualizada_em': __import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),
-        }).execute()
+        }, on_conflict='bot_origem').execute()
     except Exception as e:
         log.warning(f'  Erro ao registrar sessao_betfair: {e}')
 
 
-def obter_sessao_betfair():
-    """Retorna o timestamp ISO de inicio da sessao Betfair atual, ou None."""
+def obter_sessao_betfair(bot_id=None):
+    """Retorna o timestamp ISO de inicio da sessao Betfair atual para o bot_id informado
+    (ou o bot do proprio processo, via SUPABASE_BOT_ID, se nao informado), ou None."""
     if not SUPABASE_ATIVO:
         return None
     try:
-        resp = _client.table('sessao_betfair').select('iniciada_em').eq('id', 1).execute()
+        import os
+        alvo = bot_id or os.getenv('SUPABASE_BOT_ID_OVERRIDE', SUPABASE_BOT_ID)
+        resp = _client.table('sessao_betfair').select('iniciada_em').eq('bot_origem', alvo).execute()
         if resp.data:
             return resp.data[0]['iniciada_em']
     except Exception as e:
@@ -124,6 +128,8 @@ def registrar_analise_supabase(info: dict, aprovado: bool, motivos: list = None)
             'runners_cs_map':      info.get('runners_cs_map', {}),
             'no_limite':           info.get('no_limite', False),
             'no_limite_detalhes':  info.get('no_limite_detalhes', ''),
+            'confianca_grupo':     info.get('confianca_grupo'),
+            'confianca_pct':       info.get('confianca_pct'),
             'sombra_razao_estreita': info.get('sombra_razao_estreita'),
             'sombra_odd01_min25': info.get('sombra_odd01_min25'),
             'sombra_odd01_min30': info.get('sombra_odd01_min30'),

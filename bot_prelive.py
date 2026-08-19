@@ -17,6 +17,7 @@ except ImportError:
     COMANDOS_DISPONIVEL = False
     APOSTAS_DISPONIVEL = False
 from telegram_client import enviar_mensagem
+from confianca import classificar_confianca, formatar_para_telegram
 import supabase_integration as sb
 from datetime import datetime, timezone, timedelta
 
@@ -1344,6 +1345,10 @@ def analisar_jogo(event_id: str, nome_jogo: str, minutos: float, market_id_cs_hi
         detalhes_limite.append(f'liquidez={resultado.get("liquidez_disponivel")} perto do piso {LIQUIDEZ_MINIMA_CS_DISPONIVEL}')
     resultado['no_limite'] = bool(detalhes_limite)
     resultado['no_limite_detalhes'] = '; '.join(detalhes_limite)
+    from confianca import classificar_confianca
+    _conf = classificar_confianca(resultado.get('minuto'), resultado.get('no_limite'))
+    resultado['confianca_grupo'] = _conf.grupo
+    resultado['confianca_pct'] = _conf.win_rate_pct
     resultado['aprovado'] = True
 
     # --- MODO SOMBRA: filtros candidatos, apenas logados, NAO bloqueiam aprovacao ---
@@ -1371,6 +1376,8 @@ def formatar_alerta(info: dict) -> str:
     minutos    = info['minutos']
     tempo_str  = f'⏰ *Inicia em:* {minutos} min' if minutos >= 0 else f'🔴 *Ao vivo:* {abs(minutos)} min de jogo'
     ia_str     = f'\n🤖 _IA: {info["ia_motivo"]}_' if info.get('ia_motivo') and info['ia_motivo'] != 'IA indisponível' else ''
+    _confianca = classificar_confianca(minutos, info.get('no_limite'))
+    confianca_str = formatar_para_telegram(_confianca)
     if APENAS_LAY_01:
         lays_str = f'🔴 LAY *0-1* @ {info["odd_01"]:.2f} _(filtro: apenas 0-1)_'
     elif APENAS_LAY_10:
@@ -1395,6 +1402,7 @@ def formatar_alerta(info: dict) -> str:
         f'| Total: £{info.get("liquidez_total", 0):,.0f}\n'
         f'━━━━━━━━━━━━━━━━━━━━\n'
         f'🆔 `{info.get("market_id_cs", "")}`\n'
+        f'{confianca_str}\n'
         f'📡 _Monitorando odds e saída automaticamente_{ia_str}'
     )
 
@@ -1630,6 +1638,7 @@ def rodar_bot():
 
     while True:
         try:
+            bf.renovar_token_se_necessario()  # fix 19/08: LAY nunca chamava isso, so o Under25 -- causa provavel do bloqueio de conta perto das ~23h
             aplicar_filtros_supabase()
             # Gravar métricas a cada ciclo (função tem controle interno de 1h)
             sb.gravar_metricas_periodico()
