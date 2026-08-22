@@ -2,10 +2,20 @@
 # ~/bot-prelive-betfair/watchdog_bot.sh
 # Reinicia bot-betfair.service se detectar travamento (total ou silencioso)
 # e avisa no Telegram sempre que reiniciar por travamento.
+#
+# 21/08: adicionado dedupe de alertas -- antes, se a fila de jogos ficasse
+# vazia por muitas horas (ex: madrugada), o watchdog reiniciava E alertava
+# a CADA ciclo de cron (5 em 5 min) enquanto a lacuna sem /analises seguia
+# crescendo, gerando uma rajada de mensagens identicas no Telegram sem
+# nenhum ganho real (reiniciar nao cria jogo novo pra analisar). Agora so
+# reage de novo quando uma analise NOVA acontecer e DEPOIS ficar silencioso
+# de novo (incidente genuinamente diferente), usando um arquivo de estado
+# com o timestamp da ultima analise ja tratada.
 
 SERVICE="bot-betfair.service"
 LOG_FILE="/home/ubuntu/bot-prelive-betfair/watchdog.log"
 ENV_FILE="/home/ubuntu/bot-prelive-betfair/.env"
+STATE_FILE="/home/ubuntu/bot-prelive-betfair/.watchdog_silencioso_ts"
 
 LIMITE_MUDO_MIN=5
 LIMITE_SEM_ANALISE_MIN=180
@@ -59,13 +69,24 @@ fi
 diff_analise_min=$(( (agora - ultima_analise_ts) / 60 ))
 
 if [ "$diff_analise_min" -ge "$LIMITE_SEM_ANALISE_MIN" ]; then
-    log "TRAVAMENTO SILENCIOSO detectado: sem POST /analises há ${diff_analise_min}min (processo ainda 'vivo'). Reiniciando $SERVICE..."
-    alertar_telegram "🐛 *Watchdog*: bot-betfair sem gravar análises há ${diff_analise_min}min (travamento silencioso). Reiniciando agora..."
-    sudo systemctl restart "$SERVICE"
-    sleep 5
-    status=$(systemctl is-active $SERVICE)
-    log "Restart executado. Status: $status"
-    alertar_telegram "✅ *Watchdog*: restart concluído. Status: ${status}"
+    ts_ja_tratado=""
+    if [ -f "$STATE_FILE" ]; then
+        ts_ja_tratado=$(cat "$STATE_FILE" 2>/dev/null)
+    fi
+
+    if [ "$ts_ja_tratado" == "$ultima_analise_ts" ]; then
+        log "TRAVAMENTO SILENCIOSO ja tratado (sem /analises há ${diff_analise_min}min, mesmo incidente -- ultima_analise_ts=${ultima_analise_ts}). Sem novo restart/alerta."
+    else
+        log "TRAVAMENTO SILENCIOSO detectado: sem POST /analises há ${diff_analise_min}min (processo ainda 'vivo'). Reiniciando $SERVICE..."
+        alertar_telegram "🐛 *Watchdog*: bot-betfair sem gravar análises há ${diff_analise_min}min (travamento silencioso). Reiniciando agora..."
+        sudo systemctl restart "$SERVICE"
+        sleep 5
+        status=$(systemctl is-active $SERVICE)
+        log "Restart executado. Status: $status"
+        alertar_telegram "✅ *Watchdog*: restart concluído. Status: ${status}"
+        echo "$ultima_analise_ts" > "$STATE_FILE"
+    fi
 else
     log "OK — mudo há ${diff_mudo_min}min, sem análise há ${diff_analise_min}min (dentro do limite)"
+    rm -f "$STATE_FILE"
 fi

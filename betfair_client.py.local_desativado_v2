@@ -1,0 +1,246 @@
+import requests
+import urllib.request
+import urllib.error
+import json
+import os
+import base64
+import tempfile
+from datetime import datetime, timezone, timedelta
+from dotenv import load_dotenv
+
+import time
+from functools import wraps
+import saude
+from telegram_client import enviar_mensagem
+
+def retry_exponencial(max_tentativas=3, delay_inicial=1, backoff=2):
+    """Decorator que retenta com backoff exponencial em caso de erro."""
+    def decorador(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            tentativa = 0
+            delay = delay_inicial
+            ultima_excecao = None
+            
+            while tentativa < max_tentativas:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    tentativa += 1
+                    ultima_excecao = e
+                    if tentativa < max_tentativas:
+                        print(f'[Retry] Tentativa {tentativa}/{max_tentativas} falhou: {e}')
+                        print(f'[Retry] Aguardando {delay}s antes de retry...')
+                        time.sleep(delay)
+                        delay *= backoff
+                    else:
+                        print(f'[Retry] Todas as {max_tentativas} tentativas falharam')
+            
+            raise ultima_excecao
+        return wrapper
+    return decorador
+
+
+load_dotenv(override=True)
+
+EMAIL   = os.getenv("BETFAIR_USERNAME")
+SENHA   = os.getenv("BETFAIR_PASSWORD")
+APP_KEY = os.getenv("BETFAIR_APP_KEY")
+
+SESSION_TOKEN = None
+ULTIMO_LOGIN  = None
+ULTIMO_KEEP_ALIVE = None
+KEEP_ALIVE_INTERVALO_HORAS = 4
+LOGIN_FALHAS_CONSECUTIVAS = 0
+LOGIN_CIRCUIT_BREAKER_LIMITE = 3
+LOGIN_CIRCUIT_BREAKER_COOLDOWN_SEGUNDOS = 600
+CIRCUIT_BREAKER_ATIVO_ATE = None
+
+_cert_path: str | None = None
+_key_path:  str | None = None
+
+def _preparar_certificado() -> tuple[str, str]:
+    global _cert_path, _key_path
+    if _cert_path and _key_path:
+        return _cert_path, _key_path
+    cert_env = os.getenv("BETFAIR_CERT")
+    key_env  = os.getenv("BETFAIR_KEY")
+    if cert_env and key_env:
+        tmp_dir = tempfile.gettempdir()
+        _cert_path = os.path.join(tmp_dir, "betfair.crt")
+        _key_path  = os.path.join(tmp_dir, "betfair.key")
+        with open(_cert_path, "wb") as f:
+            f.write(base64.b64decode(cert_env))
+        with open(_key_path, "wb") as f:
+            f.write(base64.b64decode(key_env))
+        print("[Betfair] Certificado carregado via variáveis de ambiente.")
+    else:
+        _cert_path = "client-2048_1.crt"
+        _key_path  = "client-2048.KEY"
+        print("[Betfair] Certificado carregado via arquivos locais.")
+    return _cert_path, _key_path
+
+LOGIN_COOLDOWN_SEGUNDOS = 30
+ULTIMA_TENTATIVA_LOGIN = None
+
+def login() -> bool:
+    global SESSION_TOKEN, ULTIMO_LOGIN, ULTIMA_TENTATIVA_LOGIN, LOGIN_FALHAS_CONSECUTIVAS, CIRCUIT_BREAKER_ATIVO_ATE
+    agora_tentativa = datetime.now(timezone.utc)
+    if CIRCUIT_BREAKER_ATIVO_ATE is not None and agora_tentativa < CIRCUIT_BREAKER_ATIVO_ATE:
+        return False
+    if ULTIMA_TENTATIVA_LOGIN is not None:
+        segundos = (agora_tentativa - ULTIMA_TENTATIVA_LOGIN).total_seconds()
+        if segundos < LOGIN_COOLDOWN_SEGUNDOS:
+            print(f"[Betfair] Login em cooldown ({segundos:.0f}s desde ultima tentativa) - pulando")
+            return SESSION_TOKEN is not None
+    ULTIMA_TENTATIVA_LOGIN = agora_tentativa
+    cert_path, key_path = _preparar_certificado()
+    try:
+        resp = requests.post(
+            "https://identitysso-cert.betfair.bet.br/api/certlogin",
+            data=f"username={EMAIL}&password={SENHA}",
+            cert=(cert_path, key_path),
+            headers={"X-Application": APP_KEY, "Content-Type": "application/x-www-form-urlencoded"},
+            timeout=(10, 20),
+        )
+        data = resp.json()
+        if resp.status_code == 200 and data.get("loginStatus") == "SUCCESS":
+            SESSION_TOKEN = data["sessionToken"]
+            ULTIMO_LOGIN  = datetime.now(timezone.utc)
+            LOGIN_FALHAS_CONSECUTIVAS = 0
+            CIRCUIT_BREAKER_ATIVO_ATE = None
+            print("[Betfair] Login OK!")
+            saude.registrar("betfair", True)
+            return True
+        print(f"[Betfair] Falha no login: {resp.text}")
+    except Exception as e:
+        print(f"[Betfair] Erro no login: {e}")
+        saude.registrar("betfair", False, str(e))
+    LOGIN_FALHAS_CONSECUTIVAS += 1
+    saude.registrar("betfair", False, f"login falhou ({LOGIN_FALHAS_CONSECUTIVAS}x seguidas)")
+    if LOGIN_FALHAS_CONSECUTIVAS >= LOGIN_CIRCUIT_BREAKER_LIMITE:
+        CIRCUIT_BREAKER_ATIVO_ATE = datetime.now(timezone.utc) + timedelta(seconds=LOGIN_CIRCUIT_BREAKER_COOLDOWN_SEGUNDOS)
+        try:
+            enviar_mensagem(f"Bot LAY: {LOGIN_FALHAS_CONSECUTIVAS} falhas de login seguidas na Betfair. Pausando tentativas por {LOGIN_CIRCUIT_BREAKER_COOLDOWN_SEGUNDOS//60}min para evitar bloqueio de conta.")
+        except Exception:
+            pass
+        print(f"[Betfair] Circuit breaker ativado: pausando logins por {LOGIN_CIRCUIT_BREAKER_COOLDOWN_SEGUNDOS}s")
+    return False
+
+def renovar_token_se_necessario() -> bool:
+    global ULTIMO_KEEP_ALIVE
+    if ULTIMO_LOGIN is None:
+        return login()
+    horas_desde_login = (datetime.now(timezone.utc) - ULTIMO_LOGIN).total_seconds() / 3600
+    horas_desde_keepalive = (
+        (datetime.now(timezone.utc) - ULTIMO_KEEP_ALIVE).total_seconds() / 3600
+        if ULTIMO_KEEP_ALIVE is not None else horas_desde_login
+    )
+    if horas_desde_keepalive >= KEEP_ALIVE_INTERVALO_HORAS:
+        if keep_alive():
+            return True
+        print("[Betfair] Keep-alive falhou, forcando login novo...")
+        return login()
+    return True
+
+def keep_alive() -> bool:
+    global ULTIMO_KEEP_ALIVE, SESSION_TOKEN
+    if not SESSION_TOKEN:
+        return False
+    try:
+        resp = requests.post(
+            "https://identitysso.betfair.bet.br/api/keepAlive",
+            headers={"X-Application": APP_KEY, "X-Authentication": SESSION_TOKEN, "Accept": "application/json"},
+            timeout=(10, 20),
+        )
+        data = resp.json()
+        if resp.status_code == 200 and data.get("status") == "SUCCESS":
+            ULTIMO_KEEP_ALIVE = datetime.now(timezone.utc)
+            print("[Betfair] Keep-alive OK!")
+            saude.registrar("betfair", True)
+            return True
+        print(f"[Betfair] Keep-alive falhou: {resp.text}")
+        saude.registrar("betfair", False, f"keep-alive falhou: {resp.text}")
+    except Exception as e:
+        print(f"[Betfair] Erro no keep-alive: {e}")
+        saude.registrar("betfair", False, str(e))
+    return False
+
+def logout() -> bool:
+    global SESSION_TOKEN, ULTIMO_LOGIN
+    if not SESSION_TOKEN:
+        return True
+    try:
+        resp = requests.post(
+            "https://identitysso.betfair.bet.br/api/logout",
+            headers={"X-Application": APP_KEY, "X-Authentication": SESSION_TOKEN, "Accept": "application/json"},
+            timeout=(10, 20),
+        )
+        print(f"[Betfair] Logout: {resp.status_code} {resp.text}")
+    except Exception as e:
+        print(f"[Betfair] Erro no logout: {e}")
+    SESSION_TOKEN = None
+    ULTIMO_LOGIN = None
+    return True
+
+def chamar_api(rpc: str, tentativas: int = 3) -> list | None:
+    """Retorna a lista de resultados em caso de sucesso (pode ser vazia
+    se a API respondeu normalmente sem resultados), ou None se houve
+    uma falha real (erro de rede, HTTP, timeout, etc.) apos esgotar as tentativas.
+    Retry com backoff so para falhas transitorias (timeout/rede); erro HTTP nao retenta."""
+    if CIRCUIT_BREAKER_ATIVO_ATE is not None and datetime.now(timezone.utc) < CIRCUIT_BREAKER_ATIVO_ATE:
+        return None
+    renovar_token_se_necessario()
+    url = "https://api.betfair.bet.br/exchange/betting/json-rpc/v1"
+    for tentativa in range(1, tentativas + 1):
+        headers = {"X-Application": APP_KEY, "X-Authentication": SESSION_TOKEN, "content-type": "application/json"}
+        try:
+            req = urllib.request.Request(url, rpc.encode("utf-8"), headers)
+            raw = urllib.request.urlopen(req, timeout=15).read().decode("utf-8")
+            parsed = json.loads(raw)
+            if "error" in parsed:
+                erro = parsed["error"]
+                print(f"[Betfair] Erro JSON-RPC: {erro}")
+                saude.registrar("betfair", False, str(erro))
+                if "INVALID_SESSION" in str(erro):
+                    login()
+                    if tentativa < tentativas:
+                        time.sleep(2 * tentativa)
+                        continue
+                return None
+            saude.registrar("betfair", True)
+            return parsed.get("result", [])
+        except urllib.error.HTTPError as e:
+            print(f"[Betfair] HTTPError: {e.code}")
+            saude.registrar("betfair", False, f"HTTPError {e.code}")
+            break
+        except Exception as e:
+            print(f"[Betfair] Erro (tentativa {tentativa}/{tentativas}): {e}")
+            saude.registrar("betfair", False, str(e))
+            if tentativa < tentativas:
+                time.sleep(2 * tentativa)
+    return None
+
+def listar_mercados(event_id: str, tipos: list = None) -> list:
+    filtro = {"eventIds": [event_id]}
+    if tipos:
+        filtro["marketTypeCodes"] = tipos
+    rpc = json.dumps({"jsonrpc": "2.0", "method": "SportsAPING/v1.0/listMarketCatalogue",
+        "params": {"filter": filtro, "maxResults": "200",
+            "marketProjection": ["COMPETITION","EVENT","EVENT_TYPE","RUNNER_DESCRIPTION","MARKET_START_TIME"]}, "id": 1})
+    return chamar_api(rpc)
+
+def listar_odds(market_ids: list, dados: list = None) -> list:
+    if dados is None:
+        dados = ["EX_BEST_OFFERS"]
+    rpc = json.dumps({"jsonrpc": "2.0", "method": "SportsAPING/v1.0/listMarketBook",
+        "params": {"marketIds": market_ids, "priceProjection": {"priceData": dados, "virtualise": "true"}}, "id": 1})
+    return chamar_api(rpc)
+
+def get_back(runner: dict, posicao: int = 0) -> float | None:
+    offers = runner.get("ex", {}).get("availableToBack", [])
+    return offers[posicao]["price"] if len(offers) > posicao else None
+
+def get_lay(runner: dict, posicao: int = 0) -> float | None:
+    offers = runner.get("ex", {}).get("availableToLay", [])
+    return offers[posicao]["price"] if len(offers) > posicao else None

@@ -5,12 +5,13 @@ import json
 import os
 import base64
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 import time
 from functools import wraps
 import saude
+from telegram_client import enviar_mensagem
 
 def retry_exponencial(max_tentativas=3, delay_inicial=1, backoff=2):
     """Decorator que retenta com backoff exponencial em caso de erro."""
@@ -48,6 +49,12 @@ APP_KEY = os.getenv("BETFAIR_APP_KEY")
 
 SESSION_TOKEN = None
 ULTIMO_LOGIN  = None
+ULTIMO_KEEP_ALIVE = None
+KEEP_ALIVE_INTERVALO_HORAS = 4
+LOGIN_FALHAS_CONSECUTIVAS = 0
+LOGIN_CIRCUIT_BREAKER_LIMITE = 3
+LOGIN_CIRCUIT_BREAKER_COOLDOWN_SEGUNDOS = 600
+CIRCUIT_BREAKER_ATIVO_ATE = None
 
 _cert_path: str | None = None
 _key_path:  str | None = None
@@ -77,8 +84,10 @@ LOGIN_COOLDOWN_SEGUNDOS = 30
 ULTIMA_TENTATIVA_LOGIN = None
 
 def login() -> bool:
-    global SESSION_TOKEN, ULTIMO_LOGIN, ULTIMA_TENTATIVA_LOGIN
+    global SESSION_TOKEN, ULTIMO_LOGIN, ULTIMA_TENTATIVA_LOGIN, LOGIN_FALHAS_CONSECUTIVAS, CIRCUIT_BREAKER_ATIVO_ATE
     agora_tentativa = datetime.now(timezone.utc)
+    if CIRCUIT_BREAKER_ATIVO_ATE is not None and agora_tentativa < CIRCUIT_BREAKER_ATIVO_ATE:
+        return False
     if ULTIMA_TENTATIVA_LOGIN is not None:
         segundos = (agora_tentativa - ULTIMA_TENTATIVA_LOGIN).total_seconds()
         if segundos < LOGIN_COOLDOWN_SEGUNDOS:
@@ -98,6 +107,8 @@ def login() -> bool:
         if resp.status_code == 200 and data.get("loginStatus") == "SUCCESS":
             SESSION_TOKEN = data["sessionToken"]
             ULTIMO_LOGIN  = datetime.now(timezone.utc)
+            LOGIN_FALHAS_CONSECUTIVAS = 0
+            CIRCUIT_BREAKER_ATIVO_ATE = None
             print("[Betfair] Login OK!")
             saude.registrar("betfair", True)
             return True
@@ -105,16 +116,55 @@ def login() -> bool:
     except Exception as e:
         print(f"[Betfair] Erro no login: {e}")
         saude.registrar("betfair", False, str(e))
+    LOGIN_FALHAS_CONSECUTIVAS += 1
+    saude.registrar("betfair", False, f"login falhou ({LOGIN_FALHAS_CONSECUTIVAS}x seguidas)")
+    if LOGIN_FALHAS_CONSECUTIVAS >= LOGIN_CIRCUIT_BREAKER_LIMITE:
+        CIRCUIT_BREAKER_ATIVO_ATE = datetime.now(timezone.utc) + timedelta(seconds=LOGIN_CIRCUIT_BREAKER_COOLDOWN_SEGUNDOS)
+        try:
+            enviar_mensagem(f"Bot LAY: {LOGIN_FALHAS_CONSECUTIVAS} falhas de login seguidas na Betfair. Pausando tentativas por {LOGIN_CIRCUIT_BREAKER_COOLDOWN_SEGUNDOS//60}min para evitar bloqueio de conta.")
+        except Exception:
+            pass
+        print(f"[Betfair] Circuit breaker ativado: pausando logins por {LOGIN_CIRCUIT_BREAKER_COOLDOWN_SEGUNDOS}s")
     return False
 
 def renovar_token_se_necessario() -> bool:
+    global ULTIMO_KEEP_ALIVE
     if ULTIMO_LOGIN is None:
         return login()
-    horas = (datetime.now(timezone.utc) - ULTIMO_LOGIN).total_seconds() / 3600
-    if horas >= 2:
-        print("[Betfair] Renovando token...")
+    horas_desde_login = (datetime.now(timezone.utc) - ULTIMO_LOGIN).total_seconds() / 3600
+    horas_desde_keepalive = (
+        (datetime.now(timezone.utc) - ULTIMO_KEEP_ALIVE).total_seconds() / 3600
+        if ULTIMO_KEEP_ALIVE is not None else horas_desde_login
+    )
+    if horas_desde_keepalive >= KEEP_ALIVE_INTERVALO_HORAS:
+        if keep_alive():
+            return True
+        print("[Betfair] Keep-alive falhou, forcando login novo...")
         return login()
     return True
+
+def keep_alive() -> bool:
+    global ULTIMO_KEEP_ALIVE, SESSION_TOKEN
+    if not SESSION_TOKEN:
+        return False
+    try:
+        resp = requests.post(
+            "https://identitysso.betfair.bet.br/api/keepAlive",
+            headers={"X-Application": APP_KEY, "X-Authentication": SESSION_TOKEN, "Accept": "application/json"},
+            timeout=(10, 20),
+        )
+        data = resp.json()
+        if resp.status_code == 200 and data.get("status") == "SUCCESS":
+            ULTIMO_KEEP_ALIVE = datetime.now(timezone.utc)
+            print("[Betfair] Keep-alive OK!")
+            saude.registrar("betfair", True)
+            return True
+        print(f"[Betfair] Keep-alive falhou: {resp.text}")
+        saude.registrar("betfair", False, f"keep-alive falhou: {resp.text}")
+    except Exception as e:
+        print(f"[Betfair] Erro no keep-alive: {e}")
+        saude.registrar("betfair", False, str(e))
+    return False
 
 def logout() -> bool:
     global SESSION_TOKEN, ULTIMO_LOGIN
@@ -138,10 +188,12 @@ def chamar_api(rpc: str, tentativas: int = 3) -> list | None:
     se a API respondeu normalmente sem resultados), ou None se houve
     uma falha real (erro de rede, HTTP, timeout, etc.) apos esgotar as tentativas.
     Retry com backoff so para falhas transitorias (timeout/rede); erro HTTP nao retenta."""
+    if CIRCUIT_BREAKER_ATIVO_ATE is not None and datetime.now(timezone.utc) < CIRCUIT_BREAKER_ATIVO_ATE:
+        return None
     renovar_token_se_necessario()
     url = "https://api.betfair.bet.br/exchange/betting/json-rpc/v1"
-    headers = {"X-Application": APP_KEY, "X-Authentication": SESSION_TOKEN, "content-type": "application/json"}
     for tentativa in range(1, tentativas + 1):
+        headers = {"X-Application": APP_KEY, "X-Authentication": SESSION_TOKEN, "content-type": "application/json"}
         try:
             req = urllib.request.Request(url, rpc.encode("utf-8"), headers)
             raw = urllib.request.urlopen(req, timeout=15).read().decode("utf-8")

@@ -38,6 +38,9 @@ MINUTOS_ANTES_INICIO    = 5
 MINUTOS_APOS_INICIO     = 15
 INTERVALO_VERIFICACAO   = 5      # minutos na janela de entrada
 INTERVALO_LONGE         = 15     # minutos para jogos > 30 min antes
+MARGEM_LOGOUT_MIN       = 15     # 21/08: folga minima (min) sem nada pendente pra deslogar da Betfair
+HORA_DESCANSO_INICIO    = 2      # 22/08: janela diaria de descanso forcado -- inicio (hora Brasilia)
+HORA_DESCANSO_FIM       = 5      # 22/08: janela diaria de descanso forcado -- fim (hora Brasilia)
 LIMIAR_JANELA_ENTRADA   = 30     # minutos: abaixo disso usa intervalo curto
 INTERVALO_RECARGA_HORAS = 0.25
 INTERVALO_RESULTADO_MIN  = 30   # minutos entre verificacoes de resultado pos-kickoff
@@ -1375,7 +1378,7 @@ def formatar_alerta(info: dict) -> str:
     btts_str   = f"Ambas Marcam @ *{info['odd_btts']:.2f}*" if info.get('odd_btts') else 'BTTS: N/A'
     minutos    = info['minutos']
     tempo_str  = f'⏰ *Inicia em:* {minutos} min' if minutos >= 0 else f'🔴 *Ao vivo:* {abs(minutos)} min de jogo'
-    ia_str     = f'\n🤖 _IA: {info["ia_motivo"]}_' if info.get('ia_motivo') and info['ia_motivo'] != 'IA indisponível' else ''
+    ia_str     = f'\n🤖 _IA: {info["ia_motivo"]}_' if info.get('ia_motivo') and info['ia_motivo'] and not info['ia_motivo'].startswith('IA indisponivel') else ''
     _confianca = classificar_confianca(minutos, info.get('no_limite'))
     confianca_str = formatar_para_telegram(_confianca)
     if APENAS_LAY_01:
@@ -1403,7 +1406,7 @@ def formatar_alerta(info: dict) -> str:
         f'━━━━━━━━━━━━━━━━━━━━\n'
         f'🆔 `{info.get("market_id_cs", "")}`\n'
         f'{confianca_str}\n'
-        f'📡 _Monitorando odds e saída automaticamente_{ia_str}'
+        f'{ia_str}'
     )
 
 
@@ -1578,9 +1581,7 @@ class AgendadorJogos:
     def status(self) -> str:
         aguardando = sum(1 for d in self.jogos.values() if d['estado'] == 'aguardando')
         return (f'Fila: {aguardando} aguardando | '
-                f'Cache: {cache_eventos.total()} bloqueados | '
-                f'Monitor odds: {monitor_odds.total()} | '
-                f'Monitor saida: {monitor_saida.total()}')
+                f'Cache: {cache_eventos.total()} bloqueados')
 
 
 def imprimir_agenda_do_dia(agendador: AgendadorJogos):
@@ -1627,7 +1628,7 @@ def rodar_bot():
         f'⏱ Janela: {MINUTOS_ANTES_INICIO} min antes até {MINUTOS_APOS_INICIO} min após início\n'
         f'🔄 Intervalo dinâmico: {INTERVALO_LONGE}min (longe) / {INTERVALO_VERIFICACAO}min (janela)\n'
         f'🧠 Análise IA: {ia_status}\n'
-        f'📡 Monitor de odds e saída: *ativo*'
+        f'🔌 Sessão Betfair: sob demanda (desloga se ocioso >{MARGEM_LOGOUT_MIN}min)'
     )
     gerar_resumo_diario()
 
@@ -1638,7 +1639,10 @@ def rodar_bot():
 
     while True:
         try:
-            bf.renovar_token_se_necessario()  # fix 19/08: LAY nunca chamava isso, so o Under25 -- causa provavel do bloqueio de conta perto das ~23h
+            # 21/08: keep-alive proativo removido -- causa raiz real do bloqueio de ~23h e
+            # sessao continua demais, nao token vencido. Login/renovacao agora e' sob demanda
+            # (chamar_api() ja loga sozinho quando nao ha sessao valida) + logout explicito
+            # nos periodos ociosos, mais abaixo no loop.
             aplicar_filtros_supabase()
             # Gravar métricas a cada ciclo (função tem controle interno de 1h)
             sb.gravar_metricas_periodico()
@@ -1754,23 +1758,54 @@ def rodar_bot():
                 except Exception as e:
                     log.warning(f'  Comandos Telegram erro: {e}')
 
-            if monitor_odds.total() > 0:
-                monitor_odds.verificar_todos()
-            if monitor_saida.total() > 0:
-                monitor_saida.verificar_todos()
+            # 21/08: monitor de odds/saida pos-aprovacao removido -- aposta e' mantida ate o
+            # resultado final (sem cash-out antecipado), entao o monitoramento continuo de
+            # odds no pos-jogo nao tem efeito pratico e so mantinha a sessao Betfair ocupada
+            # sem necessidade. Resultado final continua sendo resolvido via resultado_jogos.py
+            # (rotina separada, ja existente, INTERVALO_RESULTADO_MIN).
 
             para_verificar = agendador.jogos_para_verificar_agora()
 
             if not para_verificar:
                 proximas = [d['proxima_verificacao'] for d in agendador.jogos.values()
                             if d['estado'] == 'aguardando']
+                proxima_recarga   = ultima_recarga + timedelta(hours=INTERVALO_RECARGA_HORAS)
+                proxima_resultado = (ultimo_resultado_auto + timedelta(minutes=INTERVALO_RESULTADO_MIN)
+                                      if RESULTADO_DISPONIVEL else None)
+                candidatos = [t for t in (min(proximas) if proximas else None,
+                                           proxima_recarga, proxima_resultado) if t is not None]
+                prox_evento = min(candidatos)
+                agora_utc_idle = datetime.now(timezone.utc)
+                folga_min = (prox_evento - agora_utc_idle).total_seconds() / 60
+
+                # 22/08: janela diaria de descanso forcado (02h-05h Brasilia) -- garante que
+                # a conta Betfair fica realmente sem NENHUMA sessao aberta por um bloco todo
+                # dia, mesmo que a folga normal (MARGEM_LOGOUT_MIN) nao justificasse deslogar
+                # agora. So se aplica quando ja estamos no ramo ocioso (nao pula verificacao
+                # de jogo real que porventura caia dentro da janela).
+                hora_br_idle = agora_utc_idle.astimezone(FUSO_BRASILIA).hour
+                em_janela_descanso = HORA_DESCANSO_INICIO <= hora_br_idle < HORA_DESCANSO_FIM
+
+                # Nada precisando da Betfair nos proximos MARGEM_LOGOUT_MIN minutos -> desloga.
+                # chamar_api() faz login sozinho na proxima chamada real (recarga, analise ou
+                # checagem de resultado), entao nao ha necessidade de relogar preventivamente.
+                deve_deslogar = folga_min > MARGEM_LOGOUT_MIN or em_janela_descanso
+                if deve_deslogar:
+                    bf.logout()  # no-op barato se ja estiver deslogado
+
+                sufixo_log = ''
+                if em_janela_descanso:
+                    sufixo_log = ' | sessao Betfair encerrada (janela de descanso 02h-05h)'
+                elif deve_deslogar:
+                    sufixo_log = ' | sessao Betfair encerrada'
+
                 if proximas:
                     prox   = min(proximas)
-                    espera = max(10, min(60, (prox - datetime.now(timezone.utc)).total_seconds()))
-                    log.info(f'  Proxima: {prox.astimezone(FUSO_BRASILIA).strftime("%H:%M")} — aguardando {int(espera)}s')
+                    espera = max(10, min(60, (prox - agora_utc_idle).total_seconds()))
+                    log.info(f'  Proxima: {prox.astimezone(FUSO_BRASILIA).strftime("%H:%M")} — aguardando {int(espera)}s' + sufixo_log)
                     time.sleep(espera)
                 else:
-                    log.info('  Sem jogos na fila. Aguardando 60s...')
+                    log.info('  Sem jogos na fila. Aguardando 60s...' + sufixo_log)
                     time.sleep(60)
                 continue
 
@@ -1823,9 +1858,6 @@ def rodar_bot():
                                 )
                         except Exception as e:
                             log.error(f"  Aposta auto erro: {e}")
-
-                    monitor_odds.adicionar(info)
-                    monitor_saida.adicionar(info)
 
                 else:
                     motivos = info['motivo_reprovacao']

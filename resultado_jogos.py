@@ -285,7 +285,7 @@ def resumo_resultados(data_str=None) -> str:
         nome   = info.get('nome_jogo', '')
         horario= info.get('horario', '--:--')
         placar = info.get('placar_final', '')
-        result = info.get('resultado_geral', '')
+        result = info.get('resultado_geral') or ''
         pnl    = info.get('pnl_estimado', 0) or 0
 
         result_norm = result.replace('Ó', 'O')  # tolera dados legados com acento

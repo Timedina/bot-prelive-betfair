@@ -39,13 +39,15 @@ def _validar_analise(info: dict) -> tuple[bool, str]:
     return True, ''
 
 
-def _validar_aposta(info: dict, res_aposta: dict) -> tuple[bool, str]:
-    """Valida se uma aposta tem todos os campos obrigatórios."""
+def _validar_aposta(info: dict, res_aposta: dict, tipo_aposta: str = 'LAY') -> tuple[bool, str]:
+    """Valida se uma aposta tem todos os campos obrigatórios.
+    tipo_aposta='LAY' (padrao, estrategia LAY Correct Score) exige placar_lay.
+    tipo_aposta='BACK' (ex: Under 2.5) nao exige placar_lay, coluna fica NULL."""
     if not info.get('event_id'):
         return False, 'event_id vazio'
     if not info.get('nome_jogo'):
         return False, 'nome_jogo vazio'
-    if not res_aposta.get('placar_lay'):
+    if tipo_aposta == 'LAY' and not res_aposta.get('placar_lay'):
         return False, 'placar_lay não definido'
     if not res_aposta.get('odd_lay'):
         return False, 'odd_lay não definido'
@@ -152,13 +154,15 @@ def registrar_analise_supabase(info: dict, aprovado: bool, motivos: list = None)
         saude.registrar("supabase", True)
 
 
-def registrar_aposta_supabase(info: dict, res_aposta: dict):
-    """Registra a aposta REAL colocada (com stake, liability, betId) na tabela `apostas`."""
+def registrar_aposta_supabase(info: dict, res_aposta: dict, tipo_aposta: str = 'LAY'):
+    """Registra a aposta REAL/simulada colocada (com stake, liability) na tabela `apostas`.
+    tipo_aposta='LAY': liability = stake*(odd-1) (perda potencial da lay), placar_lay obrigatorio.
+    tipo_aposta='BACK': liability = stake (perda maxima de uma back e o proprio stake), placar_lay fica NULL."""
     if not SUPABASE_ATIVO:
         return
     
     # Validar antes de tentar insert
-    valido, motivo = _validar_aposta(info, res_aposta)
+    valido, motivo = _validar_aposta(info, res_aposta, tipo_aposta)
     if not valido:
         log.warning(f'  ⚠️ APOSTA NAO VALIDADA ({info.get("nome_jogo", "?")}): {motivo}')
         return
@@ -166,7 +170,10 @@ def registrar_aposta_supabase(info: dict, res_aposta: dict):
     try:
         odd_lay = res_aposta.get('odd_lay') or 0
         stake = res_aposta.get('stake', 0) or 0
-        liability = round(stake * (odd_lay - 1), 2) if odd_lay > 1 else 0
+        if tipo_aposta == 'BACK':
+            liability = stake
+        else:
+            liability = round(stake * (odd_lay - 1), 2) if odd_lay > 1 else 0
         # odd_matched so tem valor real em apostas nao-simuladas (avgPrice=0 sempre em simulacao)
         avg_price = res_aposta.get('avgPrice') or 0
         odd_matched = avg_price if (not res_aposta.get('simulado', True) and avg_price > 0) else None
