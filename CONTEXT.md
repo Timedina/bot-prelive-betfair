@@ -519,3 +519,40 @@ Requer env vars: ODDSPAPI_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_KEY
 - **Pendente**: confirmar amanhã via `/sessao` ou `v_status_sessao_betfair` que os dois bots aparecem deslogados simultaneamente entre 02h-05h, e que nenhum jogo relevante costuma cair nesse horário (o que geraria logins pontuais dentro da janela, esperado e aceitável, só não deveria ser frequente).
 
 *Ultima atualizacao: 22/08/2026*
+
+## Atualização 22/08/2026 (cont.) — Fix critico: tipo_aposta faltando em producao + confirmacao de metricas gravando + sync Git pendente
+
+- **Descoberto ao revisar o codigo real do VPS**: o `bot_under25.py` rodando em producao ja estava numa versao bem mais avancada do que o GitHub tinha registrado (arquitetura "modo sob demanda" — login so durante janelas de jogo, calculadas a partir dos kickoffs das proximas 6h; "janela de descanso forcado" 02h-05h Brasilia; `checagens_feitas`/`placar_ainda_0x0` ja incorporados) — confirma que o VPS diverge do GitHub ha varios dias, por trabalho aplicado direto via SSH sem commit.
+- **Bug critico pego antes de virar problema maior**: o `bot_under25.py` do VPS ja chamava `sb.registrar_aposta_supabase(..., tipo_aposta="BACK")`, mas o `supabase_integration.py` do VPS **ainda nao tinha o parametro `tipo_aposta`** — toda tentativa de gravar aposta estava batendo em `TypeError`, capturado pelo `except` generico e so logado como warning, **sem gravar nada em `apostas`**, silenciosamente.
+  - Fix aplicado via script Python com ancora+backup (padrao ja usado no projeto): `apply_tipo_aposta_supabase.py` (adiciona `tipo_aposta='LAY'` default em `_validar_aposta()` e `registrar_aposta_supabase()`, `tipo_aposta='BACK'` pula a exigencia de `placar_lay` e calcula `liability=stake`) e `apply_metrica_reprovacao_under25.py` (adiciona `sb.registrar_metrica_reprovacao(...)` nas 2 reprovacoes de `verificar_entradas`, que ja existiam sem essa chamada).
+  - `py_compile` validado, `bot-under25.service` reiniciado sem erro.
+- **Validado via Supabase (MCP) apos o restart**: tabela `metricas` ja gravando `taxa_aprovacao` pro bot Under25 (4 registros, via `gravar_metricas_periodico()` que roda todo ciclo mesmo ocioso). `mercados_under25_disponiveis` e `reprovacao_motivo` ainda em 0 no momento da checagem — esperado, ja que so gravam dentro de `verificar_entradas()`, que so roda quando o bot esta "ativo" (dentro de janela de jogo), e nao havia janela aberta na hora do teste. `apostas` seguia em 0 registros tambem — esperado pelo mesmo motivo (sem entrada aprovada ainda desde o fix).
+- **Falso alarme investigado e descartado**: usuario reportou print do Telegram com alertas "Liquidez insuficiente" chegando de novo (Ludogorets v Slavia Sofia etc, 12:55-13:03 horario Brasilia). Confirmado via timestamp do systemd (`bot-under25.service` reiniciado as 17:28 UTC = 14:28 Brasilia) que as mensagens do print sao **anteriores ao restart** (scroll de historico do Telegram), nao mensagens novas pos-fix. `grep` no codigo rodando confirmou que so existe `registrar_metrica_reprovacao`, sem `enviar_alerta`, na reprovacao de liquidez. `ps aux` confirmou 1 unico processo do bot rodando (sem instancia duplicada).
+- **PENDENTE — Git sincronizado nesta sessao**: `git status` mostrava dias de mudanca acumulada nao commitada (modo sob demanda, descanso forcado, `confianca.py`, fix de `sessao_betfair` por bot, keepalive do LAY, scripts `apply_*.py`, e os fixes desta sessao) — commit de sincronizacao (`git add -A && git commit && git push`) executado.
+
+*Ultima atualizacao: 22/08/2026*
+
+## Atualização 22/08/2026 (cont. 2) — Git sincronizado + Analise de perdas do LAY: descoberta da "zona de perigo" de liquidez (nao-linear) + backtest combinado com drawdown
+
+- **Git sincronizado**: `git add -A && git commit && git push` executado no VPS. Commit `8bb1dfd`, 24 arquivos (1716 insercoes, 102 remocoes) — VPS e GitHub agora batem 100%. Cobriu dias de mudanca acumulada (modo sob demanda, descanso forcado, `confianca.py`, sessao_betfair por bot, keepalive LAY, scripts `apply_*.py`) mais os fixes desta sessao.
+- **Gatilho da analise**: usuario reportou 2 novas perdas do LAY no dia (Vasas v Puskas Akademia entre elas), pediu analise. Investigacao expandida pra achar padroes novos de filtro, alem do sistema de confianca (`minuto=-10`/`no_limite`) ja existente.
+- **Vasas v Puskas Akademia individualmente**: `minuto=-10` E `no_limite=true` (razao=1.58 perto do teto 1.7) simultaneos — ja era Grupo B (91%) no sistema de confianca, nao uma anomalia fora do padrao conhecido.
+- **Filtro por liga descartado**: perdas espalhadas em ~15 ligas diferentes, quase todas com 1 perda isolada cada (ex: Hungarian NB I 1/5, Swiss Super League 1/1) — amostra pequena demais por liga pra ser sinal, seria overfitting excluir qualquer uma.
+- **Descoberta principal — liquidez disponivel no momento da aprovacao NAO tem relacao linear com resultado** (confirmado por `corr()` no Postgres: liquidez, odd_01, liquidez/odd, razao odd_10/odd_01 — todas com correlacao ≈0, entre -0.04 e +0.06). O padrao real e uma **zona de perigo no meio da distribuicao**, nao um teto:
+  - Liquidez < £1200: seguro (98%+ win rate nas faixas mais baixas)
+  - **Liquidez £1200–£2600: zona de perigo — concentra literalmente TODAS as perdas de liquidez alta** (10 de 15-16 perdas totais do LAY caem exatamente nessa faixa, nenhuma perda registrada fora dela)
+  - Liquidez > £2600 (jogos grandes de verdade, ligas populares): **100% vitoria** na amostra, ate liquidez de £20.734 — jogo grande NAO e sinal de risco, e o oposto.
+  - Correcao de rota durante a analise: primeira sugestao (teto simples `LIQUIDEZ_MAXIMA=1200`) foi descartada por cortar os jogos grandes lucrativos junto com o lixo — trocado por **exclusao de faixa** (`LIQUIDEZ_ZONA_MIN=1200` / `LIQUIDEZ_ZONA_MAX=2600`), preservando liquidez alta.
+- **Backtest com curva de PnL acumulado e drawdown maximo** (233-235 apostas resolvidas do LAY, via SQL com window functions no Supabase/MCP):
+
+| Cenario | N | Perdas | Win rate | PnL final | Drawdown maximo |
+|---|---|---|---|---|---|
+| Baseline (sem filtro) | 235 | 16 | 93.2% | -361.50 | -648.17 |
+| So faixa liquidez (exclui 1200-2600) | 183 | 6 | 96.7% | +410.24 | -207.33 |
+| Combinado (faixa liquidez + Grupo A de confianca) | 105 | 2 | 98.1% | +426.43 | **-100.00** |
+
+  - Combinado deixa so 1-2 perdas em toda a amostra historica (a unica restante: Nashville SC v Leon, North American Leagues Cup, liquidez baixa £722, sem sinais de risco conhecidos — perda "aleatoria" de verdade, fora de qualquer padrao identificavel).
+  - So-liquidez da quase o mesmo PnL final que o combinado (+410 vs +426) com quase o dobro do volume (183 vs 105 apostas) — trade-off: liquidez sozinha maximiza volume/generalizacao, combinado maximiza estabilidade (drawdown 3x menor).
+- **NADA IMPLEMENTADO AINDA EM CODIGO** — essa atualizacao e so a analise/backtest. Usuario ainda nao decidiu entre: (a) so filtro de zona de liquidez, (b) combinado com Grupo A de confianca, ou (c) continuar so observando mais tempo antes de travar qualquer filtro novo em producao. Proximo passo, quando decidido: adicionar `LIQUIDEZ_ZONA_MIN`/`LIQUIDEZ_ZONA_MAX` na tabela `filtros` do Supabase (por bot_id do LAY) e a checagem correspondente em `bot_prelive.py`, mesmo padrao do `LIQUIDEZ_MINIMA` existente. Se decidir pelo combinado, tambem precisa transformar `confianca_grupo` de classificacao informativa (so aparece no Telegram) pra filtro de bloqueio real na aprovacao.
+
+*Ultima atualizacao: 22/08/2026*
